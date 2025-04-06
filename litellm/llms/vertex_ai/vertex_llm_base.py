@@ -327,6 +327,7 @@ class VertexBase:
                 model=model,
                 stream=stream,
                 gemini_api_key=gemini_api_key,
+                api_base=api_base
             )
             # auth_header = None  # this field is not used for gemin
         else:
