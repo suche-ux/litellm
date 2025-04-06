@@ -348,16 +348,17 @@ class VertexBase:
                 vertex_location=vertex_location,
                 vertex_api_version=version,
             )
+        return auth_header, url
 
-        return self._check_custom_proxy(
-            api_base=api_base,
-            auth_header=auth_header,
-            custom_llm_provider=custom_llm_provider,
-            gemini_api_key=gemini_api_key,
-            endpoint=endpoint,
-            stream=stream,
-            url=url,
-        )
+        # return self._check_custom_proxy(
+        #     api_base=api_base,
+        #     auth_header=auth_header,
+        #     custom_llm_provider=custom_llm_provider,
+        #     gemini_api_key=gemini_api_key,
+        #     endpoint=endpoint,
+        #     stream=stream,
+        #     url=url,
+        # )
 
     def get_access_token(
         self,
