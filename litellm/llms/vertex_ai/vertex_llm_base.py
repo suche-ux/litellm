@@ -103,7 +103,7 @@ class VertexBase:
                 scopes=["https://www.googleapis.com/auth/cloud-platform"]
             )
             if project_id is None:
-                project_id = creds_project_id
+                project_id = creds_project_id or creds.quota_project_id
 
         self.refresh_auth(creds)
 
