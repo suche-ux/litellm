@@ -232,15 +232,15 @@ class VertexBase:
 
         credentials.refresh(Request())
 
-    def _get_id_token(self, audience):
-        """Get an ID token if running as service account."""
-        from google.auth.transport.requests import AuthorizedSession, Request
-        from google.oauth2.id_token import fetch_id_token
-        assert self._credentials is not None
-        session = AuthorizedSession(self._credentials)
-        request = Request(session)
-        self._credentials.refresh(request)
-        return fetch_id_token(request, audience)
+    # def _get_id_token(self, audience):
+    #     """Get an ID token if running as service account."""
+    #     from google.auth.transport.requests import AuthorizedSession, Request
+    #     from google.oauth2.id_token import fetch_id_token
+    #     assert self._credentials is not None
+    #     session = AuthorizedSession(self._credentials)
+    #     request = Request(session)
+    #     self._credentials.refresh(request)
+    #     return fetch_id_token(request, audience)
 
 
     def _ensure_access_token(
