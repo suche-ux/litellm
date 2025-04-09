@@ -4,6 +4,7 @@
 import json
 import time
 import uuid
+import time
 from copy import deepcopy
 from functools import partial
 from typing import (
@@ -1412,6 +1413,7 @@ def make_sync_call(
             break
         except httpx.HTTPStatusError as e:
             retries -= 1
+            time.sleep(60)
     if retries == 0:
         raise VertexAIError(status_code=500, message="retries exhausted")
     assert response is not None
