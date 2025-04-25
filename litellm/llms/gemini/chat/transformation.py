@@ -88,6 +88,7 @@ class GoogleAIStudioGeminiConfig(VertexGeminiConfig):
             "modalities",
             "parallel_tool_calls",
             "web_search_options",
+            "seed",
         ]
         if supports_reasoning(model):
             supported_params.append("reasoning_effort")
