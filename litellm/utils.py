@@ -4566,6 +4566,9 @@ def _get_model_info_helper(  # noqa: PLR0915
                 ):
                     _model_info = None
 
+            if _model_info is None:
+                _model_info = {}
+
             _input_cost_per_token: Optional[float] = _model_info.get(
                 "input_cost_per_token"
             )
@@ -4591,7 +4594,7 @@ def _get_model_info_helper(  # noqa: PLR0915
                 _output_cost_per_token = 0
 
             return ModelInfoBase(
-                key=key,
+                key=key or '',
                 max_tokens=_model_info.get("max_tokens", None),
                 max_input_tokens=_model_info.get("max_input_tokens", None),
                 max_output_tokens=_model_info.get("max_output_tokens", None),
