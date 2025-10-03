@@ -255,13 +255,13 @@ class VertexBase:
         """
         Returns auth token and project id
         """
-        # if custom_llm_provider == "gemini":
-        #     return "", ""
-        # else:
-        return self.get_access_token(
-            credentials=credentials,
-            project_id=project_id,
-        )
+        if custom_llm_provider == "gemini":
+            return "", ""
+        else:
+            return self.get_access_token(
+                credentials=credentials,
+                project_id=project_id,
+            )
 
     def is_using_v1beta1_features(self, optional_params: dict) -> bool:
         """
