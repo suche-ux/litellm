@@ -341,7 +341,7 @@ class VertexBase:
                 gemini_api_key=gemini_api_key,
                 api_base=api_base
             )
-            # auth_header = None  # this field is not used for gemin
+            auth_header = None  # this field is not used for gemin
         else:
             vertex_location = self.get_vertex_region(
                 vertex_region=vertex_location,
