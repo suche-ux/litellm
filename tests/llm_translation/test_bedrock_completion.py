@@ -27,6 +27,7 @@ import litellm
 from litellm import (
     ModelResponse,
     RateLimitError,
+    ServiceUnavailableError,
     Timeout,
     completion,
     completion_cost,
@@ -69,7 +70,7 @@ def test_completion_bedrock_claude_completion_auth():
 
     try:
         response = completion(
-            model="bedrock/anthropic.claude-instant-v1",
+            model="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
             messages=messages,
             max_tokens=10,
             temperature=0.1,
@@ -105,7 +106,7 @@ def test_completion_bedrock_guardrails(streaming):
     try:
         if streaming is False:
             response = completion(
-                model="anthropic.claude-v2",
+                model="anthropic.claude-3-5-sonnet-20240620-v1:0",
                 messages=[
                     {
                         "content": "where do i buy coffee from? ",
@@ -133,7 +134,7 @@ def test_completion_bedrock_guardrails(streaming):
         else:
             litellm.set_verbose = True
             response = completion(
-                model="anthropic.claude-v2",
+                model="anthropic.claude-3-5-sonnet-20240620-v1:0",
                 messages=[
                     {
                         "content": "where do i buy coffee from? ",
@@ -160,39 +161,6 @@ def test_completion_bedrock_guardrails(streaming):
                 saw_trace is True
             ), "Did not see trace in response even when trace=enabled sent in the guardrailConfig"
 
-    except RateLimitError:
-        pass
-    except Exception as e:
-        pytest.fail(f"Error occurred: {e}")
-
-
-def test_completion_bedrock_claude_2_1_completion_auth():
-    print("calling bedrock claude 2.1 completion params auth")
-    import os
-
-    aws_access_key_id = os.environ["AWS_ACCESS_KEY_ID"]
-    aws_secret_access_key = os.environ["AWS_SECRET_ACCESS_KEY"]
-    aws_region_name = os.environ["AWS_REGION_NAME"]
-
-    os.environ.pop("AWS_ACCESS_KEY_ID", None)
-    os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
-    os.environ.pop("AWS_REGION_NAME", None)
-    try:
-        response = completion(
-            model="bedrock/anthropic.claude-v2:1",
-            messages=messages,
-            max_tokens=10,
-            temperature=0.1,
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            aws_region_name=aws_region_name,
-        )
-        # Add any assertions here to check the response
-        print(response)
-
-        os.environ["AWS_ACCESS_KEY_ID"] = aws_access_key_id
-        os.environ["AWS_SECRET_ACCESS_KEY"] = aws_secret_access_key
-        os.environ["AWS_REGION_NAME"] = aws_region_name
     except RateLimitError:
         pass
     except Exception as e:
@@ -228,7 +196,7 @@ def test_completion_bedrock_claude_external_client_auth():
         )
 
         response = completion(
-            model="bedrock/anthropic.claude-instant-v1",
+            model="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
             messages=messages,
             max_tokens=10,
             temperature=0.1,
@@ -265,7 +233,7 @@ def test_completion_bedrock_claude_sts_client_auth():
         litellm.set_verbose = True
 
         response = completion(
-            model="bedrock/anthropic.claude-instant-v1",
+            model="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
             messages=messages,
             max_tokens=10,
             temperature=0.1,
@@ -734,8 +702,6 @@ def test_bedrock_stop_value(stop, model):
     "model",
     [
         "anthropic.claude-3-sonnet-20240229-v1:0",
-        # "meta.llama3-70b-instruct-v1:0",
-        "anthropic.claude-v2",
         "mistral.mixtral-8x7b-instruct-v0:1",
     ],
 )
@@ -939,7 +905,7 @@ def test_bedrock_ptu():
         )
         try:
             response = litellm.completion(
-                model="bedrock/anthropic.claude-instant-v1",
+                model="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
                 messages=[{"role": "user", "content": "What's AWS?"}],
                 model_id=model_id,
                 client=client,
@@ -1105,7 +1071,7 @@ def test_completion_bedrock_external_client_region():
         with patch.object(client, "post", new=Mock()) as mock_client_post:
             try:
                 response = completion(
-                    model="bedrock/anthropic.claude-instant-v1",
+                    model="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
                     messages=messages,
                     max_tokens=10,
                     temperature=0.1,
@@ -1266,6 +1232,7 @@ def test_bedrock_tools_pt_invalid_names():
 
 def test_bedrock_tools_transformation_valid_params():
     from litellm.types.llms.bedrock import ToolJsonSchemaBlock
+
     tools = [
         {
             "type": "function",
@@ -1288,14 +1255,17 @@ def test_bedrock_tools_transformation_valid_params():
     result = _bedrock_tools_pt(tools)
 
     print("bedrock tools after prompt formatting=", result)
-     # Ensure the keys for properties in the response is a subset of keys in ToolJsonSchemaBlock
+    # Ensure the keys for properties in the response is a subset of keys in ToolJsonSchemaBlock
     toolJsonSchema = result[0]["toolSpec"]["inputSchema"]["json"]
     assert toolJsonSchema is not None
     print("transformed toolJsonSchema keys=", toolJsonSchema.keys())
-    print("allowed ToolJsonSchemaBlock keys=", ToolJsonSchemaBlock.__annotations__.keys())
-    assert set(toolJsonSchema.keys()).issubset(set(ToolJsonSchemaBlock.__annotations__.keys()))
+    print(
+        "allowed ToolJsonSchemaBlock keys=", ToolJsonSchemaBlock.__annotations__.keys()
+    )
+    assert set(toolJsonSchema.keys()).issubset(
+        set(ToolJsonSchemaBlock.__annotations__.keys())
+    )
 
-    
     assert isinstance(result, list)
     assert len(result) == 1
     assert "toolSpec" in result[0]
@@ -1303,9 +1273,11 @@ def test_bedrock_tools_transformation_valid_params():
     assert result[0]["toolSpec"]["description"] == "Invalid name test"
     assert "inputSchema" in result[0]["toolSpec"]
     assert "json" in result[0]["toolSpec"]["inputSchema"]
-    assert result[0]["toolSpec"]["inputSchema"]["json"]["properties"]["test"]["type"] == "string"
+    assert (
+        result[0]["toolSpec"]["inputSchema"]["json"]["properties"]["test"]["type"]
+        == "string"
+    )
     assert "test" in result[0]["toolSpec"]["inputSchema"]["json"]["required"]
-
 
 
 def test_not_found_error():
@@ -2049,10 +2021,16 @@ def test_bedrock_context_window_error():
 
 def test_bedrock_converse_route():
     litellm.set_verbose = True
-    litellm.completion(
-        model="bedrock/converse/us.amazon.nova-pro-v1:0",
-        messages=[{"role": "user", "content": "Hello, world!"}],
-    )
+    try:
+        litellm.completion(
+            model="bedrock/converse/us.amazon.nova-pro-v1:0",
+            messages=[{"role": "user", "content": "Hello, world!"}],
+        )
+    except ServiceUnavailableError as e:
+        if "Too many requests" in str(e):
+            pytest.skip("Skipping test due to AWS Bedrock rate limiting")
+        else:
+            raise
 
 
 def test_bedrock_mapped_converse_models():
@@ -2269,7 +2247,6 @@ class TestBedrockConverseNovaTestSuite(BaseLLMChatTest):
         """Test that tool calls with no arguments is translated correctly. Relevant issue: https://github.com/BerriAI/litellm/issues/6833"""
         pass
 
-    
     def test_prompt_caching(self):
         """
         TODO: Ensure this test passes our base llm test suite
@@ -2364,7 +2341,8 @@ def test_bedrock_custom_continue_message():
 
 def test_bedrock_no_default_message():
     """
-    Test that empty content is handled correctly when modify_params=False
+    Test that empty content is replaced with placeholder when modify_params=False.
+    AWS Bedrock doesn't allow empty or whitespace-only text content.
     """
     messages = [
         {"role": "user", "content": "Hello!"},
@@ -2380,15 +2358,13 @@ def test_bedrock_no_default_message():
         llm_provider="bedrock",
     )
 
-    # Verify empty message is present and valid message remains
+    # Verify empty message is replaced with placeholder and valid message remains
     assistant_messages = [
         msg for msg in formatted_messages if msg["role"] == "assistant"
     ]
-    assert len(assistant_messages) == 2  # Both empty and valid messages present
-    assert assistant_messages[0]["content"][0]["text"] == ""  # First message is empty
-    assert (
-        assistant_messages[1]["content"][0]["text"] == "Valid response"
-    )  # Second message is valid
+    assert len(assistant_messages) == 2
+    assert assistant_messages[0]["content"][0]["text"] == "."
+    assert assistant_messages[1]["content"][0]["text"] == "Valid response"
 
 
 @pytest.mark.parametrize("top_k_param", ["top_k", "topK"])
@@ -2479,7 +2455,9 @@ def test_bedrock_process_empty_text_blocks():
     assert modified_message["content"][0]["text"] == "Please continue."
 
 
-@pytest.mark.skip(reason="Skipping test due to bedrock changing their response schema support. Come back to this.")
+@pytest.mark.skip(
+    reason="Skipping test due to bedrock changing their response schema support. Come back to this."
+)
 def test_nova_optional_params_tool_choice():
     try:
         litellm.drop_params = True
@@ -2499,7 +2477,12 @@ def test_nova_optional_params_tool_choice():
                         "parameters": {
                             "$defs": {
                                 "TurnDurationEnum": {
-                                    "enum": ["action", "encounter", "battle", "operation"],
+                                    "enum": [
+                                        "action",
+                                        "encounter",
+                                        "battle",
+                                        "operation",
+                                    ],
                                     "title": "TurnDurationEnum",
                                     "type": "string",
                                 }
@@ -2512,10 +2495,22 @@ def test_nova_optional_params_tool_choice():
                                 },
                                 "prompt": {"title": "Prompt", "type": "string"},
                                 "name": {"title": "Name", "type": "string"},
-                                "description": {"title": "Description", "type": "string"},
-                                "competitve": {"title": "Competitve", "type": "boolean"},
-                                "players_min": {"title": "Players Min", "type": "integer"},
-                                "players_max": {"title": "Players Max", "type": "integer"},
+                                "description": {
+                                    "title": "Description",
+                                    "type": "string",
+                                },
+                                "competitve": {
+                                    "title": "Competitve",
+                                    "type": "boolean",
+                                },
+                                "players_min": {
+                                    "title": "Players Min",
+                                    "type": "integer",
+                                },
+                                "players_max": {
+                                    "title": "Players Max",
+                                    "type": "integer",
+                                },
                                 "turn_duration": {
                                     "$ref": "#/$defs/TurnDurationEnum",
                                     "description": "how long the passing of a turn should represent for a game at this scale",
@@ -2539,6 +2534,7 @@ def test_nova_optional_params_tool_choice():
         )
     except litellm.APIConnectionError:
         pass
+
 
 class TestBedrockEmbedding(BaseLLMEmbeddingTest):
     def get_base_embedding_call_args(self) -> dict:
@@ -3021,7 +3017,8 @@ def test_bedrock_application_inference_profile():
     client = HTTPHandler()
     client2 = HTTPHandler()
 
-    tools = [{
+    tools = [
+        {
             "type": "function",
             "function": {
                 "name": "get_current_weather",
@@ -3039,11 +3036,10 @@ def test_bedrock_application_inference_profile():
                         },
                     },
                     "required": ["location"],
-                }
-            }
+                },
+            },
         }
     ]
-
 
     with patch.object(client, "post") as mock_post, patch.object(
         client2, "post"
@@ -3054,7 +3050,7 @@ def test_bedrock_application_inference_profile():
                 messages=[{"role": "user", "content": "Hello, how are you?"}],
                 model_id="arn:aws:bedrock:eu-central-1:000000000000:application-inference-profile/a0a0a0a0a0a0",
                 client=client,
-                tools=tools
+                tools=tools,
             )
         except Exception as e:
             print(e)
@@ -3064,7 +3060,7 @@ def test_bedrock_application_inference_profile():
                 model="bedrock/converse/arn:aws:bedrock:eu-central-1:000000000000:application-inference-profile/a0a0a0a0a0a0",
                 messages=[{"role": "user", "content": "Hello, how are you?"}],
                 client=client2,
-                tools=tools
+                tools=tools,
             )
         except Exception as e:
             print(e)
@@ -3092,7 +3088,6 @@ def return_mocked_response(model: str):
             "stopReason": "max_tokens",
             "usage": {"inputTokens": 5, "outputTokens": 10, "totalTokens": 15},
         }
-
 
 
 @pytest.mark.parametrize(
@@ -3141,7 +3136,6 @@ async def test_bedrock_max_completion_tokens(model: str):
         }
 
 
-
 def test_bedrock_meta_llama_function_calling():
     """
     Tests that:
@@ -3149,9 +3143,10 @@ def test_bedrock_meta_llama_function_calling():
     """
     from litellm.utils import return_raw_request
     from litellm.types.utils import CallTypes
+
     tools = [
-            {
-                "type": "function",
+        {
+            "type": "function",
             "function": {
                 "name": "get_current_weather",
                 "description": "Get the current weather in a given location",
@@ -3191,4 +3186,251 @@ def test_bedrock_meta_llama_function_calling():
 
     print(response)
 
-    
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync_mode", [True, False])
+async def test_bedrock_passthrough(sync_mode: bool):
+    import litellm
+
+    litellm._turn_on_debug()
+
+    data = {
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": "Hey"}],
+        "system": [
+            {
+                "type": "text",
+                "text": "Analyze if this message indicates a new conversation topic. If it does, extract a 2-3 word title that captures the new topic. Format your response as a JSON object with two fields: 'isNewTopic' (boolean) and 'title' (string, or null if isNewTopic is false). Only include these fields, no other text.",
+            }
+        ],
+        "temperature": 0,
+        "metadata": {
+            "user_id": "5dd07c33da27e6d2968d94ea20bf47a7b090b6b158b82328d54da2909a108e84"
+        },
+        "anthropic_version": "bedrock-2023-05-31",
+        "anthropic_beta": ["claude-code-20250219"],
+    }
+
+    if sync_mode:
+        response = litellm.llm_passthrough_route(
+            model="bedrock/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            method="POST",
+            endpoint="/model/us.anthropic.claude-3-5-sonnet-20240620-v1:0/invoke",
+            data=data,
+        )
+    else:
+        response = await litellm.allm_passthrough_route(
+            model="bedrock/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            method="POST",
+            endpoint="/model/us.anthropic.claude-3-5-sonnet-20240620-v1:0/invoke",
+            data=data,
+        )
+
+    print(response.text)
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_bedrock_passthrough_router():
+    """
+    Test bedrock passthrough using litellm.Router with async mode.
+    Tests that the router:
+    1. Resolves the router model name to the actual deployment
+    2. Replaces the router model name in the endpoint with the actual deployment model
+    """
+    import litellm
+    from litellm import Router
+
+    litellm._turn_on_debug()
+
+    router = Router(
+        model_list=[
+            {
+                "model_name": "special-bedrock-model",
+                "litellm_params": {
+                    "model": "bedrock/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+                },
+            }
+        ]
+    )
+
+    data = {
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": "Hey"}],
+        "system": [
+            {
+                "type": "text",
+                "text": "Analyze if this message indicates a new conversation topic. If it does, extract a 2-3 word title that captures the new topic. Format your response as a JSON object with two fields: 'isNewTopic' (boolean) and 'title' (string, or null if isNewTopic is false). Only include these fields, no other text.",
+            }
+        ],
+        "temperature": 0,
+        "metadata": {
+            "user_id": "5dd07c33da27e6d2968d94ea20bf47a7b090b6b158b82328d54da2909a108e84"
+        },
+        "anthropic_version": "bedrock-2023-05-31",
+        "anthropic_beta": ["claude-code-20250219"],
+    }
+
+    # Endpoint uses the router model name which should be replaced with actual deployment
+    response = await router.allm_passthrough_route(
+        model="special-bedrock-model",
+        method="POST",
+        endpoint="/model/special-bedrock-model/invoke",
+        data=data,
+    )
+
+    print(response.text)
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_bedrock_converse__streaming_passthrough(monkeypatch):
+    import litellm
+    from litellm.integrations.custom_logger import CustomLogger
+    import asyncio
+
+    class MockCustomLogger(CustomLogger):
+        pass
+
+    mock_custom_logger = MockCustomLogger()
+    monkeypatch.setattr(litellm, "callbacks", [mock_custom_logger])
+
+    litellm._turn_on_debug()
+
+    data = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "text": "Write an article about impact of high inflation to GDP of a country"
+                    }
+                ],
+            }
+        ],
+        "system": [{"text": "You are an economist with access to lots of data"}],
+        "inferenceConfig": {"maxTokens": 100, "temperature": 0.5},
+    }
+    with patch.object(mock_custom_logger, "async_log_success_event") as mock_callback:
+        response = await litellm.allm_passthrough_route(
+            model="bedrock/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            method="POST",
+            endpoint="/model/us.anthropic.claude-3-5-sonnet-20240620-v1:0/converse-stream",
+            data=data,
+        )
+        async for chunk in response:
+            print(chunk)
+
+        await asyncio.sleep(1)
+
+        mock_callback.assert_called_once()
+        print(mock_callback.call_args.kwargs.keys())
+        assert "response_cost" in mock_callback.call_args.kwargs["kwargs"]
+        assert mock_callback.call_args.kwargs["kwargs"]["response_cost"] > 0
+        assert "standard_logging_object" in mock_callback.call_args.kwargs["kwargs"]
+
+
+@pytest.mark.asyncio
+async def test_bedrock_streaming_passthrough_test2(monkeypatch):
+    import litellm
+    import time
+    import asyncio
+    from unittest.mock import MagicMock
+    from litellm.integrations.custom_logger import CustomLogger
+
+    class MockCustomLogger(CustomLogger):
+        pass
+
+    mock_custom_logger = MockCustomLogger()
+    monkeypatch.setattr(litellm, "callbacks", [mock_custom_logger])
+
+    litellm._turn_on_debug()
+
+    data = {
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": "Hey"}],
+        "system": [
+            {
+                "type": "text",
+                "text": "Analyze if this message indicates a new conversation topic. If it does, extract a 2-3 word title that captures the new topic. Format your response as a JSON object with two fields: 'isNewTopic' (boolean) and 'title' (string, or null if isNewTopic is false). Only include these fields, no other text.",
+            }
+        ],
+        "temperature": 0,
+        "metadata": {
+            "user_id": "5dd07c33da27e6d2968d94ea20bf47a7b090b6b158b82328d54da2909a108e84"
+        },
+        "anthropic_version": "bedrock-2023-05-31",
+        "anthropic_beta": ["claude-code-20250219"],
+    }
+
+    with patch.object(mock_custom_logger, "async_log_success_event") as mock_callback:
+        response = await litellm.allm_passthrough_route(
+            model="bedrock/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            method="POST",
+            endpoint="/model/us.anthropic.claude-3-5-sonnet-20240620-v1:0/invoke-with-response-stream",
+            data=data,
+        )
+        async for chunk in response:
+            print(chunk)
+
+        await asyncio.sleep(5)
+
+        mock_callback.assert_called_once()
+        # check standard logging payload created
+        print(mock_callback.call_args.kwargs.keys())
+        assert "standard_logging_object" in mock_callback.call_args.kwargs["kwargs"]
+        assert "response_cost" in mock_callback.call_args.kwargs["kwargs"]
+
+
+@pytest.mark.asyncio
+async def test_bedrock_streaming_passthrough_test1(monkeypatch):
+    import litellm
+    import time
+    import asyncio
+    from unittest.mock import MagicMock
+    from litellm.integrations.custom_logger import CustomLogger
+
+    class MockCustomLogger(CustomLogger):
+        pass
+
+    mock_custom_logger = MockCustomLogger()
+    monkeypatch.setattr(litellm, "callbacks", [mock_custom_logger])
+
+    litellm._turn_on_debug()
+
+    data = {
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": "Hey"}],
+        "system": [
+            {
+                "type": "text",
+                "text": "Analyze if this message indicates a new conversation topic. If it does, extract a 2-3 word title that captures the new topic. Format your response as a JSON object with two fields: 'isNewTopic' (boolean) and 'title' (string, or null if isNewTopic is false). Only include these fields, no other text.",
+            }
+        ],
+        "temperature": 0,
+        "metadata": {
+            "user_id": "5dd07c33da27e6d2968d94ea20bf47a7b090b6b158b82328d54da2909a108e84"
+        },
+        "anthropic_version": "bedrock-2023-05-31",
+        "anthropic_beta": ["claude-code-20250219"],
+    }
+
+    with patch.object(mock_custom_logger, "async_log_success_event") as mock_callback:
+        response = await litellm.allm_passthrough_route(
+            model="bedrock/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            method="POST",
+            endpoint="/model/us.anthropic.claude-3-5-sonnet-20240620-v1:0/invoke-with-response-stream",
+            data=data,
+        )
+        async for chunk in response:
+            print(chunk)
+
+        await asyncio.sleep(5)
+
+        mock_callback.assert_called_once()
+        # check standard logging payload created
+        print(mock_callback.call_args.kwargs.keys())
+        assert "standard_logging_object" in mock_callback.call_args.kwargs["kwargs"]
+        assert "response_cost" in mock_callback.call_args.kwargs["kwargs"]

@@ -1,11 +1,12 @@
 import json
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from typing_extensions import (
     Protocol,
     Required,
     Self,
+    TypedDict,
     TypeGuard,
     get_origin,
     override,
@@ -40,6 +41,7 @@ class PartType(TypedDict, total=False):
     function_call: FunctionCall
     function_response: FunctionResponse
     thought: bool
+    thoughtSignature: str
 
 
 class HttpxFunctionCall(TypedDict):
@@ -71,6 +73,7 @@ class HttpxPartType(TypedDict, total=False):
     executableCode: HttpxExecutableCode
     codeExecutionResult: HttpxCodeExecutionResult
     thought: bool
+    thoughtSignature: str
 
 
 class HttpxContentType(TypedDict, total=False):
@@ -89,7 +92,7 @@ class SystemInstructions(TypedDict):
 
 class Schema(TypedDict, total=False):
     type: Literal["STRING", "INTEGER", "BOOLEAN", "NUMBER", "ARRAY", "OBJECT"]
-    format: str
+    format: Literal["enum", "date-time"]
     title: str
     description: str
     nullable: bool
@@ -175,6 +178,10 @@ class GeminiThinkingConfig(TypedDict, total=False):
 
 GeminiResponseModalities = Literal["TEXT", "IMAGE", "AUDIO", "VIDEO"]
 
+GeminiImageAspectRatio = Literal["1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9", "21:9"]
+
+class GeminiImageConfig(TypedDict, total=False):
+    aspectRatio: GeminiImageAspectRatio
 
 class PrebuiltVoiceConfig(TypedDict):
     voiceName: str
@@ -203,7 +210,18 @@ class GenerationConfig(TypedDict, total=False):
     responseLogprobs: bool
     logprobs: int
     responseModalities: List[GeminiResponseModalities]
+    imageConfig: GeminiImageConfig
     thinkingConfig: GeminiThinkingConfig
+
+
+class VertexToolName(str, Enum):
+    """Enum for Vertex AI tool field names."""
+    GOOGLE_SEARCH = "googleSearch"
+    GOOGLE_SEARCH_RETRIEVAL = "googleSearchRetrieval"
+    ENTERPRISE_WEB_SEARCH = "enterpriseWebSearch"
+    URL_CONTEXT = "url_context"
+    CODE_EXECUTION = "code_execution"
+    GOOGLE_MAPS = "googleMaps"
 
 
 class Tools(TypedDict, total=False):
@@ -213,6 +231,7 @@ class Tools(TypedDict, total=False):
     enterpriseWebSearch: dict
     url_context: dict
     code_execution: dict
+    googleMaps: dict
     retrieval: Retrieval
 
 
@@ -241,6 +260,18 @@ class UsageMetadata(TypedDict, total=False):
     responseTokensDetails: List[PromptTokensDetails]
 
 
+class TokenCountDetailsResponse(TypedDict):
+    """
+    Response structure for token count details with modality breakdown.
+
+    Example:
+        {'totalTokens': 12, 'promptTokensDetails': [{'modality': 'TEXT', 'tokenCount': 12}]}
+    """
+
+    totalTokens: int
+    promptTokensDetails: List[PromptTokensDetails]
+
+
 class CachedContent(TypedDict, total=False):
     ttl: TTL
     expire_time: str
@@ -265,6 +296,7 @@ class RequestBody(TypedDict, total=False):
     safetySettings: List[SafetSettingsConfig]
     generationConfig: GenerationConfig
     cachedContent: str
+    labels: Dict[str, str]
     speechConfig: SpeechConfig
 
 
@@ -537,6 +569,10 @@ class OutputConfig(TypedDict, total=False):
     gcsDestination: GcsDestination
 
 
+class OutputInfo(TypedDict, total=False):
+    gcsOutputDirectory: str
+
+
 class GcsBucketResponse(TypedDict):
     """
     TypedDict for GCS bucket upload response
@@ -595,10 +631,57 @@ class VertexBatchPredictionResponse(TypedDict, total=False):
     model: str
     inputConfig: InputConfig
     outputConfig: OutputConfig
+    outputInfo: OutputInfo
     state: str
     createTime: str
     updateTime: str
     modelVersionId: str
+
+
+class VertexVideoImage(TypedDict, total=False):
+    """Image input for video generation"""
+
+    bytesBase64Encoded: str
+    mimeType: str
+
+
+class VertexVideoGenerationInstance(TypedDict, total=False):
+    """Instance object for Vertex AI video generation request"""
+
+    prompt: Required[str]
+    image: VertexVideoImage
+
+
+class VertexVideoGenerationParameters(TypedDict, total=False):
+    """Parameters for Vertex AI video generation"""
+
+    aspectRatio: Literal["9:16", "16:9"]
+    durationSeconds: int
+
+
+class VertexVideoGenerationRequest(TypedDict):
+    """Complete request body for Vertex AI video generation"""
+
+    instances: Required[List[VertexVideoGenerationInstance]]
+    parameters: VertexVideoGenerationParameters
+
+
+class VertexVideoOutput(TypedDict, total=False):
+    """Video output in response"""
+
+    bytesBase64Encoded: str
+    mimeType: str
+    gcsUri: str
+
+
+class VertexVideoGenerationResponse(TypedDict, total=False):
+    """Response body for Vertex AI video generation"""
+
+    name: str
+    done: bool
+    response: Dict[str, Any]
+    metadata: Dict[str, Any]
+    error: Dict[str, Any]
 
 
 VERTEX_CREDENTIALS_TYPES = Union[str, Dict[str, str]]

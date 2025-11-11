@@ -1,5 +1,15 @@
 import json
-from typing import Any, AsyncIterator, List, Literal, Optional, Tuple, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+    cast,
+)
 
 from openai.types.chat.chat_completion_chunk import Choice as OpenAIStreamingChoice
 
@@ -10,11 +20,15 @@ from litellm.types.llms.anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessagesToolChoice,
     AnthropicMessagesUserMessageParam,
+    AnthropicResponseContentBlockRedactedThinking,
     AnthropicResponseContentBlockText,
+    AnthropicResponseContentBlockThinking,
     AnthropicResponseContentBlockToolUse,
     ContentBlockDelta,
     ContentJsonBlockDelta,
     ContentTextBlockDelta,
+    ContentThinkingBlockDelta,
+    ContentThinkingSignatureBlockDelta,
     MessageBlockDelta,
     MessageDelta,
     UsageDelta,
@@ -29,9 +43,11 @@ from litellm.types.llms.openai import (
     ChatCompletionAssistantToolCall,
     ChatCompletionImageObject,
     ChatCompletionImageUrlObject,
+    ChatCompletionRedactedThinkingBlock,
     ChatCompletionRequest,
     ChatCompletionSystemMessage,
     ChatCompletionTextObject,
+    ChatCompletionThinkingBlock,
     ChatCompletionToolCallFunctionChunk,
     ChatCompletionToolChoiceFunctionParam,
     ChatCompletionToolChoiceObjectParam,
@@ -41,9 +57,12 @@ from litellm.types.llms.openai import (
     ChatCompletionToolParamFunctionChunk,
     ChatCompletionUserMessage,
 )
-from litellm.types.utils import Choices, ModelResponse, Usage
+from litellm.types.utils import Choices, ModelResponse, StreamingChoices, Usage
 
 from .streaming_iterator import AnthropicStreamWrapper
+
+if TYPE_CHECKING:
+    from litellm.types.llms.anthropic import ContentBlockContentBlockDict
 
 
 class AnthropicAdapter:
@@ -90,15 +109,16 @@ class AnthropicAdapter:
     def translate_completion_output_params(
         self, response: ModelResponse
     ) -> Optional[AnthropicMessagesResponse]:
-
         return LiteLLMAnthropicMessagesAdapter().translate_openai_response_to_anthropic(
             response=response
         )
 
     def translate_completion_output_params_streaming(
-        self, completion_stream: Any
+        self, completion_stream: Any, model: str
     ) -> Union[AsyncIterator[bytes], None]:
-        anthropic_wrapper = AnthropicStreamWrapper(completion_stream=completion_stream)
+        anthropic_wrapper = AnthropicStreamWrapper(
+            completion_stream=completion_stream, model=model
+        )
         # Return the SSE-wrapped version for proper event formatting
         return anthropic_wrapper.async_anthropic_sse_wrapper()
 
@@ -147,14 +167,20 @@ class LiteLLMAnthropicMessagesAdapter:
                             )
                             new_user_content_list.append(text_obj)
                         elif content.get("type") == "image":
-                            image_url = ChatCompletionImageUrlObject(
-                                url=f"data:{content.get('type', '')};base64,{content.get('source', '')}"
-                            )
-                            image_obj = ChatCompletionImageObject(
-                                type="image_url", image_url=image_url
+                            # Convert Anthropic image format to OpenAI format
+                            source = content.get("source", {})
+                            openai_image_url = (
+                                self._translate_anthropic_image_to_openai(source)
                             )
 
-                            new_user_content_list.append(image_obj)
+                            if openai_image_url:
+                                image_url_obj = ChatCompletionImageUrlObject(
+                                    url=openai_image_url
+                                )
+                                image_obj = ChatCompletionImageObject(
+                                    type="image_url", image_url=image_url_obj
+                                )
+                                new_user_content_list.append(image_obj)
                         elif content.get("type") == "tool_result":
                             if "content" not in content:
                                 tool_result = ChatCompletionToolMessage(
@@ -190,15 +216,26 @@ class LiteLLMAnthropicMessagesAdapter:
                                             )
                                             tool_message_list.append(tool_result)
                                         elif c.get("type") == "image":
-                                            image_str = f"data:{c.get('type', '')};base64,{c.get('source', '')}"
+                                            # Convert Anthropic image format to OpenAI format for tool results
+                                            source = c.get("source", {})
+                                            openai_image_url = (
+                                                self._translate_anthropic_image_to_openai(
+                                                    source
+                                                )
+                                                or ""
+                                            )
+
                                             tool_result = ChatCompletionToolMessage(
                                                 role="tool",
                                                 tool_call_id=content.get(
                                                     "tool_use_id", ""
                                                 ),
-                                                content=image_str,
+                                                content=openai_image_url,
                                             )
                                             tool_message_list.append(tool_result)
+
+            if len(tool_message_list) > 0:
+                new_messages.extend(tool_message_list)
 
             if user_message is not None:
                 new_messages.append(user_message)
@@ -206,12 +243,12 @@ class LiteLLMAnthropicMessagesAdapter:
             if len(new_user_content_list) > 0:
                 new_messages.append({"role": "user", "content": new_user_content_list})  # type: ignore
 
-            if len(tool_message_list) > 0:
-                new_messages.extend(tool_message_list)
-
             ## ASSISTANT MESSAGE ##
             assistant_message_str: Optional[str] = None
             tool_calls: List[ChatCompletionAssistantToolCall] = []
+            thinking_blocks: List[
+                Union[ChatCompletionThinkingBlock, ChatCompletionRedactedThinkingBlock]
+            ] = []
             if m["role"] == "assistant":
                 if isinstance(m.get("content"), str):
                     assistant_message_str = str(m.get("content", ""))
@@ -238,14 +275,40 @@ class LiteLLMAnthropicMessagesAdapter:
                                         function=function_chunk,
                                     )
                                 )
+                            elif content.get("type") == "thinking":
+                                thinking_block = ChatCompletionThinkingBlock(
+                                    type="thinking",
+                                    thinking=content.get("thinking") or "",
+                                    signature=content.get("signature") or "",
+                                    cache_control=content.get("cache_control", {}),
+                                )
+                                thinking_blocks.append(thinking_block)
+                            elif content.get("type") == "redacted_thinking":
+                                redacted_thinking_block = (
+                                    ChatCompletionRedactedThinkingBlock(
+                                        type="redacted_thinking",
+                                        data=content.get("data") or "",
+                                        cache_control=content.get("cache_control", {}),
+                                    )
+                                )
+                                thinking_blocks.append(redacted_thinking_block)
 
-            if assistant_message_str is not None or len(tool_calls) > 0:
+            if (
+                assistant_message_str is not None
+                or len(tool_calls) > 0
+                or len(thinking_blocks) > 0
+            ):
                 assistant_message = ChatCompletionAssistantMessage(
                     role="assistant",
                     content=assistant_message_str,
+                    thinking_blocks=(
+                        thinking_blocks if len(thinking_blocks) > 0 else None
+                    ),
                 )
                 if len(tool_calls) > 0:
                     assistant_message["tool_calls"] = tool_calls
+                if len(thinking_blocks) > 0:
+                    assistant_message["thinking_blocks"] = thinking_blocks  # type: ignore
                 new_messages.append(assistant_message)
 
         return new_messages
@@ -298,6 +361,7 @@ class LiteLLMAnthropicMessagesAdapter:
         """
         This is used by the beta Anthropic Adapter, for translating anthropic `/v1/messages` requests to the openai format.
         """
+        # Debug: Processing Anthropic message request
         new_messages: List[AllMessageValues] = []
 
         ## CONVERT ANTHROPIC MESSAGES TO OPENAI
@@ -365,17 +429,84 @@ class LiteLLMAnthropicMessagesAdapter:
 
         return new_kwargs
 
-    def _translate_openai_content_to_anthropic(
-        self, choices: List[Choices]
-    ) -> List[
-        Union[AnthropicResponseContentBlockText, AnthropicResponseContentBlockToolUse]
+    def _translate_anthropic_image_to_openai(self, image_source: dict) -> Optional[str]:
+        """
+        Translate Anthropic image source format to OpenAI-compatible image URL.
+
+        Anthropic supports two image source formats:
+        1. Base64: {"type": "base64", "media_type": "image/jpeg", "data": "..."}
+        2. URL: {"type": "url", "url": "https://..."}
+
+        Returns the properly formatted image URL string, or None if invalid format.
+        """
+        if not isinstance(image_source, dict):
+            return None
+
+        source_type = image_source.get("type")
+
+        if source_type == "base64":
+            # Base64 image format
+            media_type = image_source.get("media_type", "image/jpeg")
+            image_data = image_source.get("data", "")
+            if image_data:
+                return f"data:{media_type};base64,{image_data}"
+        elif source_type == "url":
+            # URL-referenced image format
+            return image_source.get("url", "")
+
+        return None
+
+    def _translate_openai_content_to_anthropic(self, choices: List[Choices]) -> List[
+        Union[
+            AnthropicResponseContentBlockText,
+            AnthropicResponseContentBlockToolUse,
+            AnthropicResponseContentBlockThinking,
+            AnthropicResponseContentBlockRedactedThinking,
+        ]
     ]:
         new_content: List[
             Union[
-                AnthropicResponseContentBlockText, AnthropicResponseContentBlockToolUse
+                AnthropicResponseContentBlockText,
+                AnthropicResponseContentBlockToolUse,
+                AnthropicResponseContentBlockThinking,
+                AnthropicResponseContentBlockRedactedThinking,
             ]
         ] = []
         for choice in choices:
+            # Handle thinking blocks first
+            if (
+                hasattr(choice.message, "thinking_blocks")
+                and choice.message.thinking_blocks
+            ):
+                for thinking_block in choice.message.thinking_blocks:
+                    if thinking_block.get("type") == "thinking":
+                        thinking_value = thinking_block.get("thinking", "")
+                        signature_value = thinking_block.get("signature", "")
+                        new_content.append(
+                            AnthropicResponseContentBlockThinking(
+                                type="thinking",
+                                thinking=(
+                                    str(thinking_value)
+                                    if thinking_value is not None
+                                    else ""
+                                ),
+                                signature=(
+                                    str(signature_value)
+                                    if signature_value is not None
+                                    else None
+                                ),
+                            )
+                        )
+                    elif thinking_block.get("type") == "redacted_thinking":
+                        data_value = thinking_block.get("data", "")
+                        new_content.append(
+                            AnthropicResponseContentBlockRedactedThinking(
+                                type="redacted_thinking",
+                                data=str(data_value) if data_value is not None else "",
+                            )
+                        )
+
+            # Handle tool calls
             if (
                 choice.message.tool_calls is not None
                 and len(choice.message.tool_calls) > 0
@@ -386,9 +517,14 @@ class LiteLLMAnthropicMessagesAdapter:
                             type="tool_use",
                             id=tool_call.id,
                             name=tool_call.function.name or "",
-                            input=json.loads(tool_call.function.arguments),
+                            input=(
+                                json.loads(tool_call.function.arguments)
+                                if tool_call.function.arguments
+                                else {}
+                            ),
                         )
                     )
+            # Handle text content
             elif choice.message.content is not None:
                 new_content.append(
                     AnthropicResponseContentBlockText(
@@ -437,16 +573,71 @@ class LiteLLMAnthropicMessagesAdapter:
 
         return translated_obj
 
-    def _translate_streaming_openai_chunk_to_anthropic(
-        self, choices: List[OpenAIStreamingChoice]
+    def _translate_streaming_openai_chunk_to_anthropic_content_block(
+        self, choices: List[Union[OpenAIStreamingChoice, StreamingChoices]]
     ) -> Tuple[
-        Literal["text_delta", "input_json_delta"],
-        Union[ContentTextBlockDelta, ContentJsonBlockDelta],
+        Literal["text", "tool_use", "thinking"],
+        "ContentBlockContentBlockDict",
     ]:
+        from litellm._uuid import uuid
+        from litellm.types.llms.anthropic import TextBlock, ToolUseBlock
+
+        for choice in choices:
+            if choice.delta.content is not None and len(choice.delta.content) > 0:
+                return "text", TextBlock(type="text", text="")
+            elif (
+                choice.delta.tool_calls is not None
+                and len(choice.delta.tool_calls) > 0
+                and choice.delta.tool_calls[0].function is not None
+            ):
+                return "tool_use", ToolUseBlock(
+                    type="tool_use",
+                    id=choice.delta.tool_calls[0].id or str(uuid.uuid4()),
+                    name=choice.delta.tool_calls[0].function.name or "",
+                    input={},
+                )
+            elif isinstance(choice, StreamingChoices) and hasattr(
+                choice.delta, "thinking_blocks"
+            ):
+                thinking_blocks = choice.delta.thinking_blocks or []
+                if len(thinking_blocks) > 0:
+                    thinking_block = thinking_blocks[0]
+                    if thinking_block["type"] == "thinking":
+                        thinking = thinking_block.get("thinking") or ""
+                        signature = thinking_block.get("signature") or ""
+
+                        assert isinstance(thinking, str)
+                        assert isinstance(signature, str)
+
+                        if thinking and signature:
+                            raise ValueError(
+                                "Both `thinking` and `signature` in a single streaming chunk isn't supported."
+                            )
+
+                        return "thinking", ChatCompletionThinkingBlock(
+                            type="thinking", thinking=thinking, signature=signature
+                        )
+
+        return "text", TextBlock(type="text", text="")
+
+    def _translate_streaming_openai_chunk_to_anthropic(
+        self, choices: List[Union[OpenAIStreamingChoice, StreamingChoices]]
+    ) -> Tuple[
+        Literal["text_delta", "input_json_delta", "thinking_delta", "signature_delta"],
+        Union[
+            ContentTextBlockDelta,
+            ContentJsonBlockDelta,
+            ContentThinkingBlockDelta,
+            ContentThinkingSignatureBlockDelta,
+        ],
+    ]:
+
         text: str = ""
+        reasoning_content: str = ""
+        reasoning_signature: str = ""
         partial_json: Optional[str] = None
         for choice in choices:
-            if choice.delta.content is not None:
+            if choice.delta.content is not None and len(choice.delta.content) > 0:
                 text += choice.delta.content
             elif choice.delta.tool_calls is not None:
                 partial_json = ""
@@ -455,17 +646,45 @@ class LiteLLMAnthropicMessagesAdapter:
                         tool.function is not None
                         and tool.function.arguments is not None
                     ):
-                        partial_json += tool.function.arguments
+                        partial_json = (partial_json or "") + tool.function.arguments
+            elif isinstance(choice, StreamingChoices) and hasattr(
+                choice.delta, "thinking_blocks"
+            ):
+                thinking_blocks = choice.delta.thinking_blocks or []
+                if len(thinking_blocks) > 0:
+                    for thinking_block in thinking_blocks:
+                        if thinking_block["type"] == "thinking":
+                            thinking = thinking_block.get("thinking") or ""
+                            signature = thinking_block.get("signature") or ""
+
+                            assert isinstance(thinking, str)
+                            assert isinstance(signature, str)
+
+                            reasoning_content += thinking
+                            reasoning_signature += signature
+
+        if reasoning_content and reasoning_signature:
+            raise ValueError(
+                "Both `reasoning` and `signature` in a single streaming chunk isn't supported."
+            )
 
         if partial_json is not None:
             return "input_json_delta", ContentJsonBlockDelta(
                 type="input_json_delta", partial_json=partial_json
             )
+        elif reasoning_content:
+            return "thinking_delta", ContentThinkingBlockDelta(
+                type="thinking_delta", thinking=reasoning_content
+            )
+        elif reasoning_signature:
+            return "signature_delta", ContentThinkingSignatureBlockDelta(
+                type="signature_delta", signature=reasoning_signature
+            )
         else:
             return "text_delta", ContentTextBlockDelta(type="text_delta", text=text)
 
     def translate_streaming_openai_response_to_anthropic(
-        self, response: ModelResponse
+        self, response: ModelResponse, current_content_block_index: int
     ) -> Union[ContentBlockDelta, MessageBlockDelta]:
         ## base case - final chunk w/ finish reason
         if response.choices[0].finish_reason is not None:
@@ -501,6 +720,6 @@ class LiteLLMAnthropicMessagesAdapter:
         )
         return ContentBlockDelta(
             type="content_block_delta",
-            index=response.choices[0].index,
+            index=current_content_block_index,
             delta=content_block_delta,
         )

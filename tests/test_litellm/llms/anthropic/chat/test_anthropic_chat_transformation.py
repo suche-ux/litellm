@@ -11,6 +11,7 @@ sys.path.insert(
 from unittest.mock import MagicMock, patch
 
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+from litellm.types.utils import PromptTokensDetailsWrapper, ServerToolUse
 
 
 def test_response_format_transformation_unit_test():
@@ -50,12 +51,84 @@ def test_calculate_usage():
         "output_tokens": 550,
     }
     usage = config.calculate_usage(usage_object=usage_object, reasoning_content=None)
-    assert usage.prompt_tokens == 3
+    assert usage.prompt_tokens == 12307
     assert usage.completion_tokens == 550
-    assert usage.total_tokens == 3 + 550
+    assert usage.total_tokens == 12307 + 550
     assert usage.prompt_tokens_details.cached_tokens == 0
+    assert usage.prompt_tokens_details.cache_creation_tokens == 12304
     assert usage._cache_creation_input_tokens == 12304
     assert usage._cache_read_input_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "usage_object,expected_usage",
+    [
+        [
+            {
+                "cache_creation_input_tokens": None,
+                "cache_read_input_tokens": None,
+                "input_tokens": None,
+                "output_tokens": 43,
+                "server_tool_use": None,
+            },
+            {
+                "prompt_tokens": 0,
+                "completion_tokens": 43,
+                "total_tokens": 43,
+                "_cache_creation_input_tokens": 0,
+                "_cache_read_input_tokens": 0,
+            },
+        ],
+        [
+            {
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 200,
+                "input_tokens": 1,
+                "output_tokens": None,
+                "server_tool_use": None,
+            },
+            {
+                "prompt_tokens": 1 + 200 + 100,
+                "completion_tokens": 0,
+                "total_tokens": 1 + 200 + 100,
+                "_cache_creation_input_tokens": 100,
+                "_cache_read_input_tokens": 200,
+            },
+        ],
+        [
+            {"server_tool_use": {"web_search_requests": 10}},
+            {"server_tool_use": ServerToolUse(web_search_requests=10)},
+        ],
+    ],
+)
+def test_calculate_usage_nulls(usage_object, expected_usage):
+    """
+    Correctly deal with null values in usage object
+
+    Fixes https://github.com/BerriAI/litellm/issues/11920
+    """
+    config = AnthropicConfig()
+
+    usage = config.calculate_usage(usage_object=usage_object, reasoning_content=None)
+    for k, v in expected_usage.items():
+        assert hasattr(usage, k)
+        assert getattr(usage, k) == v
+
+
+@pytest.mark.parametrize(
+    "usage_object",
+    [{"server_tool_use": {"web_search_requests": None}}, {"server_tool_use": None}],
+)
+def test_calculate_usage_server_tool_null(usage_object):
+    """
+    Correctly deal with null values in usage object
+
+    Fixes https://github.com/BerriAI/litellm/issues/11920
+    """
+    config = AnthropicConfig()
+
+    usage = config.calculate_usage(usage_object=usage_object, reasoning_content=None)
+    assert not hasattr(usage, "server_tool_use")
 
 
 def test_extract_response_content_with_citations():
@@ -65,7 +138,7 @@ def test_extract_response_content_with_citations():
         "id": "msg_01XrAv7gc5tQNDuoADra7vB4",
         "type": "message",
         "role": "assistant",
-        "model": "claude-3-5-sonnet-20241022",
+        "model": "claude-sonnet-4-5-20250929",
         "content": [
             {"type": "text", "text": "According to the documents, "},
             {
@@ -110,7 +183,30 @@ def test_extract_response_content_with_citations():
     }
 
     _, citations, _, _, _ = config.extract_response_content(completion_response)
-    assert citations is not None
+    assert citations == [
+        [
+            {
+                "type": "char_location",
+                "cited_text": "The grass is green. ",
+                "document_index": 0,
+                "document_title": "My Document",
+                "start_char_index": 0,
+                "end_char_index": 20,
+                "supported_text": "the grass is green",
+            },
+        ],
+        [
+            {
+                "type": "char_location",
+                "cited_text": "The sky is blue.",
+                "document_index": 0,
+                "document_title": "My Document",
+                "start_char_index": 20,
+                "end_char_index": 36,
+                "supported_text": "the sky is blue",
+            },
+        ],
+    ]
 
 
 def test_map_tool_helper():
@@ -218,6 +314,7 @@ def test_map_tool_choice():
     assert result["type"] == "none"
     print(result)
 
+
 def test_transform_response_with_prefix_prompt():
     import httpx
 
@@ -229,7 +326,7 @@ def test_transform_response_with_prefix_prompt():
         "id": "msg_01XrAv7gc5tQNDuoADra7vB4",
         "type": "message",
         "role": "assistant",
-        "model": "claude-3-5-sonnet-20241022",
+        "model": "claude-sonnet-4-5-20250929",
         "content": [{"type": "text", "text": " The grass is green."}],
         "stop_reason": "end_turn",
         "stop_sequence": None,
@@ -262,3 +359,33 @@ def test_transform_response_with_prefix_prompt():
         == "You are a helpful assistant. The grass is green."
     )
 
+
+def test_get_supported_params_thinking():
+    config = AnthropicConfig()
+    params = config.get_supported_openai_params(model="claude-sonnet-4-20250514")
+    assert "thinking" in params
+
+
+def test_anthropic_memory_tool_auto_adds_beta_header():
+    """
+    Tests that LiteLLM automatically adds the required 'anthropic-beta' header
+    when the memory tool is present, and the user has NOT provided a beta header.
+    """
+
+    config = AnthropicConfig()
+    memory_tool = [{"type": "memory_20250818", "name": "memory"}]
+    messages = [{"role": "user", "content": "Remember this."}]
+
+    headers = {}
+    optional_params = {"tools": memory_tool}
+
+    config.transform_request(
+        model="claude-3-5-sonnet-20240620",
+        messages=messages,
+        optional_params=optional_params,
+        litellm_params={},
+        headers=headers,
+    )
+
+    assert "anthropic-beta" in headers
+    assert headers["anthropic-beta"] == "context-management-2025-06-27"

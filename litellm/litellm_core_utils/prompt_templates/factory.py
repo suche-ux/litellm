@@ -1,7 +1,8 @@
 import copy
+import hashlib
 import json
+import mimetypes
 import re
-import uuid
 import xml.etree.ElementTree as ET
 from enum import Enum
 from typing import Any, List, Optional, Tuple, cast, overload
@@ -12,8 +13,11 @@ import litellm
 import litellm.types
 import litellm.types.llms
 from litellm import verbose_logger
+from litellm._uuid import uuid
 from litellm.llms.custom_httpx.http_handler import HTTPHandler, get_async_httpx_client
+from litellm.types.files import get_file_extension_from_mime_type
 from litellm.types.llms.anthropic import *
+from litellm.types.llms.bedrock import CachePointBlock
 from litellm.types.llms.bedrock import MessageBlock as BedrockMessageBlock
 from litellm.types.llms.custom_http import httpxSpecialProvider
 from litellm.types.llms.ollama import OllamaVisionModelObject
@@ -35,7 +39,11 @@ from litellm.types.llms.vertex_ai import FunctionResponse as VertexFunctionRespo
 from litellm.types.llms.vertex_ai import PartType as VertexPartType
 from litellm.types.utils import GenericImageParsingChunk
 
-from .common_utils import convert_content_list_to_str, is_non_content_values_set
+from .common_utils import (
+    convert_content_list_to_str,
+    infer_content_type_from_url_and_content,
+    is_non_content_values_set,
+)
 from .image_handling import convert_url_to_base64
 
 
@@ -229,7 +237,6 @@ def ollama_pt(
         ## MERGE CONSECUTIVE ASSISTANT CONTENT ##
         while msg_i < len(messages) and messages[msg_i]["role"] == "assistant":
             assistant_content_str += convert_content_list_to_str(messages[msg_i])
-            msg_i += 1
 
             tool_calls = messages[msg_i].get("tool_calls")
             ollama_tool_calls = []
@@ -255,7 +262,7 @@ def ollama_pt(
                     f"Tool Calls: {json.dumps(ollama_tool_calls, indent=2)}"
                 )
 
-                msg_i += 1
+            msg_i += 1
 
         if assistant_content_str:
             prompt += f"### Assistant:\n{assistant_content_str}\n\n"
@@ -362,62 +369,22 @@ def phind_codellama_pt(messages):
     return prompt
 
 
-def hf_chat_template(  # noqa: PLR0915
-    model: str, messages: list, chat_template: Optional[Any] = None
-):
-    # Define Jinja2 environment
-    env = ImmutableSandboxedEnvironment()
+def _render_chat_template(
+    env, chat_template: str, bos_token: str, eos_token: str, messages: list
+) -> str:
+    """
+    Shared template rendering logic for both sync and async hf_chat_template
 
-    def raise_exception(message):
-        raise Exception(f"Error message - {message}")
+    Args:
+        env: Jinja2 environment
+        chat_template: Chat template string
+        bos_token: Beginning of sequence token
+        eos_token: End of sequence token
+        messages: Messages to render
 
-    # Create a template object from the template text
-    env.globals["raise_exception"] = raise_exception
-
-    ## get the tokenizer config from huggingface
-    bos_token = ""
-    eos_token = ""
-    if chat_template is None:
-
-        def _get_tokenizer_config(hf_model_name):
-            try:
-                url = f"https://huggingface.co/{hf_model_name}/raw/main/tokenizer_config.json"
-                # Make a GET request to fetch the JSON data
-                client = HTTPHandler(concurrent_limit=1)
-
-                response = client.get(url)
-            except Exception as e:
-                raise e
-            if response.status_code == 200:
-                # Parse the JSON data
-                tokenizer_config = json.loads(response.content)
-                return {"status": "success", "tokenizer": tokenizer_config}
-            else:
-                return {"status": "failure"}
-
-        if model in litellm.known_tokenizer_config:
-            tokenizer_config = litellm.known_tokenizer_config[model]
-        else:
-            tokenizer_config = _get_tokenizer_config(model)
-            litellm.known_tokenizer_config.update({model: tokenizer_config})
-
-        if (
-            tokenizer_config["status"] == "failure"
-            or "chat_template" not in tokenizer_config["tokenizer"]
-        ):
-            raise Exception("No chat template found")
-        ## read the bos token, eos token and chat template from the json
-        tokenizer_config = tokenizer_config["tokenizer"]  # type: ignore
-
-        bos_token = tokenizer_config["bos_token"]  # type: ignore
-        if bos_token is not None and not isinstance(bos_token, str):
-            if isinstance(bos_token, dict):
-                bos_token = bos_token.get("content", None)
-        eos_token = tokenizer_config["eos_token"]  # type: ignore
-        if eos_token is not None and not isinstance(eos_token, str):
-            if isinstance(eos_token, dict):
-                eos_token = eos_token.get("content", None)
-        chat_template = tokenizer_config["chat_template"]  # type: ignore
+    Returns:
+        Rendered template string
+    """
     try:
         template = env.from_string(chat_template)  # type: ignore
     except Exception as e:
@@ -432,7 +399,6 @@ def hf_chat_template(  # noqa: PLR0915
                 bos_token="<bos>",
             )
             return True
-
         # This will be raised if Jinja attempts to render the system message and it can't
         except Exception:
             return False
@@ -466,7 +432,7 @@ def hf_chat_template(  # noqa: PLR0915
                 )
             except Exception as e:
                 if "Conversation roles must alternate user/assistant" in str(e):
-                    # reformat messages to ensure user/assistant are alternating, if there's either 2 consecutive 'user' messages or 2 consecutive 'assistant' message, add a blank 'user' or 'assistant' message to ensure compatibility
+                    # reformat messages to ensure user/assistant are alternating
                     new_messages = []
                     for i in range(len(reformatted_messages) - 1):
                         new_messages.append(reformatted_messages[i])
@@ -490,6 +456,186 @@ def hf_chat_template(  # noqa: PLR0915
         raise Exception(
             f"Error rendering template - {str(e)}"
         )  # don't use verbose_logger.exception, if exception is raised
+
+
+async def _afetch_and_extract_template(
+    model: str, chat_template: Optional[Any], get_config_fn, get_template_fn
+) -> Tuple[str, str, str]:
+    """
+    Async version: Fetch template and tokens from HuggingFace.
+
+    Returns: (chat_template, bos_token, eos_token)
+    """
+    from litellm.litellm_core_utils.prompt_templates.huggingface_template_handler import (
+        _extract_token_value,
+    )
+
+    bos_token = ""
+    eos_token = ""
+
+    if chat_template is None:
+        # Fetch or retrieve cached tokenizer config
+        if model in litellm.known_tokenizer_config:
+            tokenizer_config = litellm.known_tokenizer_config[model]
+        else:
+            tokenizer_config = await get_config_fn(hf_model_name=model)
+            litellm.known_tokenizer_config.update({model: tokenizer_config})
+
+        # Try to get chat template from tokenizer_config.json first
+        if (
+            tokenizer_config.get("status") == "success"
+            and "tokenizer" in tokenizer_config
+            and isinstance(tokenizer_config["tokenizer"], dict)
+            and "chat_template" in tokenizer_config["tokenizer"]
+        ):
+            tokenizer_data: dict = tokenizer_config["tokenizer"]  # type: ignore
+            bos_token = _extract_token_value(
+                token_value=tokenizer_data.get("bos_token")
+            )
+            eos_token = _extract_token_value(
+                token_value=tokenizer_data.get("eos_token")
+            )
+            chat_template = tokenizer_data["chat_template"]
+        else:
+            # Fallback: Try to fetch chat template from separate .jinja file
+            template_result = await get_template_fn(hf_model_name=model)
+            if template_result.get("status") == "success":
+                chat_template = template_result["chat_template"]
+                # Still try to get tokens from tokenizer_config if available
+                if (
+                    tokenizer_config.get("status") == "success"
+                    and "tokenizer" in tokenizer_config
+                    and isinstance(tokenizer_config["tokenizer"], dict)
+                ):
+                    tokenizer_data: dict = tokenizer_config["tokenizer"]  # type: ignore
+                    bos_token = _extract_token_value(
+                        token_value=tokenizer_data.get("bos_token")
+                    )
+                    eos_token = _extract_token_value(
+                        token_value=tokenizer_data.get("eos_token")
+                    )
+            else:
+                raise Exception("No chat template found")
+
+    return chat_template, bos_token, eos_token  # type: ignore
+
+
+def _fetch_and_extract_template(
+    model: str, chat_template: Optional[Any], get_config_fn, get_template_fn
+) -> Tuple[str, str, str]:
+    """
+    Sync version: Fetch template and tokens from HuggingFace.
+
+    Returns: (chat_template, bos_token, eos_token)
+    """
+    from litellm.litellm_core_utils.prompt_templates.huggingface_template_handler import (
+        _extract_token_value,
+    )
+
+    bos_token = ""
+    eos_token = ""
+
+    if chat_template is None:
+        # Fetch or retrieve cached tokenizer config
+        if model in litellm.known_tokenizer_config:
+            tokenizer_config = litellm.known_tokenizer_config[model]
+        else:
+            tokenizer_config = get_config_fn(hf_model_name=model)
+            litellm.known_tokenizer_config.update({model: tokenizer_config})
+
+        # Try to get chat template from tokenizer_config.json first
+        if (
+            tokenizer_config.get("status") == "success"
+            and "tokenizer" in tokenizer_config
+            and isinstance(tokenizer_config["tokenizer"], dict)
+            and "chat_template" in tokenizer_config["tokenizer"]
+        ):
+            tokenizer_data: dict = tokenizer_config["tokenizer"]  # type: ignore
+            bos_token = _extract_token_value(
+                token_value=tokenizer_data.get("bos_token")
+            )
+            eos_token = _extract_token_value(
+                token_value=tokenizer_data.get("eos_token")
+            )
+            chat_template = tokenizer_data["chat_template"]
+        else:
+            # Fallback: Try to fetch chat template from separate .jinja file
+            template_result = get_template_fn(hf_model_name=model)
+            if template_result.get("status") == "success":
+                chat_template = template_result["chat_template"]
+                # Still try to get tokens from tokenizer_config if available
+                if (
+                    tokenizer_config.get("status") == "success"
+                    and "tokenizer" in tokenizer_config
+                    and isinstance(tokenizer_config["tokenizer"], dict)
+                ):
+                    tokenizer_data: dict = tokenizer_config["tokenizer"]  # type: ignore
+                    bos_token = _extract_token_value(
+                        token_value=tokenizer_data.get("bos_token")
+                    )
+                    eos_token = _extract_token_value(
+                        token_value=tokenizer_data.get("eos_token")
+                    )
+            else:
+                raise Exception("No chat template found")
+
+    return chat_template, bos_token, eos_token  # type: ignore
+
+
+async def ahf_chat_template(
+    model: str, messages: list, chat_template: Optional[Any] = None
+):
+    """HuggingFace chat template (async version)"""
+    from litellm.litellm_core_utils.prompt_templates.huggingface_template_handler import (
+        _aget_chat_template_file,
+        _aget_tokenizer_config,
+        strftime_now,
+    )
+
+    env = ImmutableSandboxedEnvironment()
+    env.globals["raise_exception"] = lambda msg: Exception(f"Error message - {msg}")
+    env.globals["strftime_now"] = strftime_now
+
+    template, bos_token, eos_token = await _afetch_and_extract_template(
+        model=model,
+        chat_template=chat_template,
+        get_config_fn=_aget_tokenizer_config,
+        get_template_fn=_aget_chat_template_file,
+    )
+    return _render_chat_template(
+        env=env,
+        chat_template=template,
+        bos_token=bos_token,
+        eos_token=eos_token,
+        messages=messages,
+    )
+
+
+def hf_chat_template(model: str, messages: list, chat_template: Optional[Any] = None):
+    """HuggingFace chat template (sync version)"""
+    from litellm.litellm_core_utils.prompt_templates.huggingface_template_handler import (
+        _get_chat_template_file,
+        _get_tokenizer_config,
+        strftime_now,
+    )
+
+    env = ImmutableSandboxedEnvironment()
+    env.globals["raise_exception"] = lambda msg: Exception(f"Error message - {msg}")
+    env.globals["strftime_now"] = strftime_now
+
+    template, bos_token, eos_token = _fetch_and_extract_template(
+        model=model,
+        chat_template=chat_template,
+        get_config_fn=_get_tokenizer_config,
+        get_template_fn=_get_chat_template_file,
+    )
+    return _render_chat_template(
+        env=env,
+        chat_template=template,
+        bos_token=bos_token,
+        eos_token=eos_token,
+        messages=messages,
+    )
 
 
 def deepseek_r1_pt(messages):
@@ -943,6 +1089,12 @@ def _azure_tool_call_invoke_helper(
     return function_call_params
 
 
+def _azure_image_url_helper(content: ChatCompletionImageObject):
+    if isinstance(content["image_url"], str):
+        content["image_url"] = {"url": content["image_url"]}
+    return
+
+
 def convert_to_azure_openai_messages(
     messages: List[AllMessageValues],
 ) -> List[AllMessageValues]:
@@ -951,6 +1103,11 @@ def convert_to_azure_openai_messages(
             function_call = m.get("function_call", None)
             if function_call is not None:
                 m["function_call"] = _azure_tool_call_invoke_helper(function_call)
+
+        if m["role"] == "user" and isinstance(m.get("content"), list):
+            for content in m.get("content", []):
+                if isinstance(content, dict) and content.get("type") == "image_url":
+                    _azure_image_url_helper(content)  # type: ignore
     return messages
 
 
@@ -1053,10 +1210,10 @@ def convert_to_gemini_tool_call_invoke(
         if tool_calls is not None:
             for tool in tool_calls:
                 if "function" in tool:
-                    gemini_function_call: Optional[
-                        VertexFunctionCall
-                    ] = _gemini_tool_call_invoke_helper(
-                        function_call_params=tool["function"]
+                    gemini_function_call: Optional[VertexFunctionCall] = (
+                        _gemini_tool_call_invoke_helper(
+                            function_call_params=tool["function"]
+                        )
                     )
                     if gemini_function_call is not None:
                         _parts_list.append(
@@ -1110,13 +1267,14 @@ def convert_to_gemini_tool_call_result(
     }
     """
     content_str: str = ""
-    if isinstance(message["content"], str):
-        content_str = message["content"]
-    elif isinstance(message["content"], List):
-        content_list = message["content"]
-        for content in content_list:
-            if content["type"] == "text":
-                content_str += content["text"]
+    if "content" in message:
+        if isinstance(message["content"], str):
+            content_str = message["content"]
+        elif isinstance(message["content"], List):
+            content_list = message["content"]
+            for content in content_list:
+                if content["type"] == "text":
+                    content_str += content["text"]
     name: Optional[str] = message.get("name", "")  # type: ignore
 
     # Recover name from last message with tool calls
@@ -1201,6 +1359,7 @@ def convert_to_anthropic_tool_result(
                     AnthropicMessagesToolResultContent(
                         type="text",
                         text=content["text"],
+                        cache_control=content.get("cache_control", None),
                     )
                 )
             elif content["type"] == "image_url":
@@ -1332,7 +1491,7 @@ def convert_to_anthropic_tool_invoke(
 
         _content_element = add_cache_control_to_content(
             anthropic_content_element=_anthropic_tool_use_param,
-            orignal_content_element=dict(tool),
+            original_content_element=dict(tool),
         )
 
         if "cache_control" in _content_element:
@@ -1354,9 +1513,9 @@ def add_cache_control_to_content(
         AnthropicMessagesToolUseParam,
         ChatCompletionThinkingBlock,
     ],
-    orignal_content_element: Union[dict, AllMessageValues],
+    original_content_element: Union[dict, AllMessageValues],
 ):
-    cache_control_param = orignal_content_element.get("cache_control")
+    cache_control_param = original_content_element.get("cache_control")
     if cache_control_param is not None and isinstance(cache_control_param, dict):
         transformed_param = ChatCompletionCachedContent(**cache_control_param)  # type: ignore
 
@@ -1569,13 +1728,13 @@ def anthropic_messages_pt(  # noqa: PLR0915
                             )
                             _content_element = add_cache_control_to_content(
                                 anthropic_content_element=_anthropic_content_element,
-                                orignal_content_element=dict(m),
+                                original_content_element=dict(m),
                             )
 
                             if "cache_control" in _content_element:
-                                _anthropic_content_element[
-                                    "cache_control"
-                                ] = _content_element["cache_control"]
+                                _anthropic_content_element["cache_control"] = (
+                                    _content_element["cache_control"]
+                                )
                             user_content.append(_anthropic_content_element)
                         elif m.get("type", "") == "text":
                             m = cast(ChatCompletionTextObject, m)
@@ -1587,7 +1746,7 @@ def anthropic_messages_pt(  # noqa: PLR0915
                             )
                             _content_element = add_cache_control_to_content(
                                 anthropic_content_element=_anthropic_text_content_element,
-                                orignal_content_element=dict(m),
+                                original_content_element=dict(m),
                             )
                             _content_element = cast(
                                 AnthropicMessagesTextParam, _content_element
@@ -1609,13 +1768,13 @@ def anthropic_messages_pt(  # noqa: PLR0915
                     }
                     _content_element = add_cache_control_to_content(
                         anthropic_content_element=_anthropic_content_text_element,
-                        orignal_content_element=dict(user_message_types_block),
+                        original_content_element=dict(user_message_types_block),
                     )
 
                     if "cache_control" in _content_element:
-                        _anthropic_content_text_element[
-                            "cache_control"
-                        ] = _content_element["cache_control"]
+                        _anthropic_content_text_element["cache_control"] = (
+                            _content_element["cache_control"]
+                        )
 
                     user_content.append(_anthropic_content_text_element)
 
@@ -1667,7 +1826,7 @@ def anthropic_messages_pt(  # noqa: PLR0915
                         )
                         _cached_message = add_cache_control_to_content(
                             anthropic_content_element=anthropic_message,
-                            orignal_content_element=dict(m),
+                            original_content_element=dict(m),
                         )
 
                         assistant_content.append(
@@ -1687,7 +1846,7 @@ def anthropic_messages_pt(  # noqa: PLR0915
 
                 _content_element = add_cache_control_to_content(
                     anthropic_content_element=_anthropic_text_content_element,
-                    orignal_content_element=dict(assistant_content_block),
+                    original_content_element=dict(assistant_content_block),
                 )
 
                 if "cache_control" in _content_element:
@@ -2338,7 +2497,6 @@ def stringify_json_tool_call_content(messages: List) -> List:
 ###### AMAZON BEDROCK #######
 
 import base64
-import mimetypes
 from email.message import Message
 
 import httpx
@@ -2383,13 +2541,17 @@ class BedrockImageProcessor:
     """Handles both sync and async image processing for Bedrock conversations."""
 
     @staticmethod
-    def _post_call_image_processing(response: httpx.Response) -> Tuple[str, str]:
+    def _post_call_image_processing(response: httpx.Response, image_url: str = "") -> Tuple[str, str]:
         # Check the response's content type to ensure it is an image
         content_type = response.headers.get("content-type")
-        if not content_type:
-            raise ValueError(
-                f"URL does not contain content-type (content-type: {content_type})"
-            )
+        
+        # Use helper function to infer content type with fallback logic
+        content_type = infer_content_type_from_url_and_content(
+            url=image_url,
+            content=response.content,
+            current_content_type=content_type,
+        )
+        
         content_type = _parse_content_type(content_type)
 
         # Convert the image content to base64 bytes
@@ -2408,7 +2570,7 @@ class BedrockImageProcessor:
             response = await client.get(image_url, follow_redirects=True)
             response.raise_for_status()  # Raise an exception for HTTP errors
 
-            return BedrockImageProcessor._post_call_image_processing(response)
+            return BedrockImageProcessor._post_call_image_processing(response, image_url)
 
         except Exception as e:
             raise e
@@ -2421,7 +2583,7 @@ class BedrockImageProcessor:
             response = client.get(image_url, follow_redirects=True)
             response.raise_for_status()  # Raise an exception for HTTP errors
 
-            return BedrockImageProcessor._post_call_image_processing(response)
+            return BedrockImageProcessor._post_call_image_processing(response, image_url)
 
         except Exception as e:
             raise e
@@ -2433,8 +2595,10 @@ class BedrockImageProcessor:
 
         # Extract MIME type using regular expression
         mime_type_match = re.match(r"data:(.*?);base64", image_metadata)
+
         if mime_type_match:
             mime_type = mime_type_match.group(1)
+            mime_type = mime_type.split(";")[0]
             image_format = mime_type.split("/")[1]
         else:
             mime_type = "image/jpeg"
@@ -2458,25 +2622,16 @@ class BedrockImageProcessor:
 
         document_types = ["application", "text"]
         is_document = any(mime_type.startswith(doc_type) for doc_type in document_types)
+
         supported_image_and_video_formats: List[str] = (
             supported_video_formats + supported_image_formats
         )
 
         if is_document:
-            potential_extensions = mimetypes.guess_all_extensions(mime_type)
-            valid_extensions = [
-                ext[1:]
-                for ext in potential_extensions
-                if ext[1:] in supported_doc_formats
-            ]
+            return BedrockImageProcessor._get_document_format(
+                mime_type=mime_type, supported_doc_formats=supported_doc_formats
+            )
 
-            if not valid_extensions:
-                raise ValueError(
-                    f"No supported extensions for MIME type: {mime_type}. Supported formats: {supported_doc_formats}"
-                )
-
-            # Use first valid extension instead of provided image_format
-            return valid_extensions[0]
         else:
             #########################################################
             # Check if image_format is an image or video
@@ -2486,6 +2641,53 @@ class BedrockImageProcessor:
                     f"Unsupported image format: {image_format}. Supported formats: {supported_image_and_video_formats}"
                 )
             return image_format
+
+    @staticmethod
+    def _get_document_format(mime_type: str, supported_doc_formats: List[str]) -> str:
+        """
+        Get the document format from the mime type
+
+        - Primary method - uses `mimetypes.guess_all_extensions`
+        - Fallback method - uses `get_file_extension_from_mime_type`
+
+        Relevant Issue: https://github.com/BerriAI/litellm/issues/12260
+
+        `mimetypes` is not available in docker containers, so we fallback to `get_file_extension_from_mime_type`
+
+        Args:
+            mime_type: The mime type of the document
+            supported_doc_formats: The supported document formats for the current model
+
+        Returns:
+            The document format
+        """
+        valid_extensions: Optional[List[str]] = None
+        potential_extensions = mimetypes.guess_all_extensions(mime_type, strict=False)
+        valid_extensions = [
+            ext[1:] for ext in potential_extensions if ext[1:] in supported_doc_formats
+        ]
+
+        # Fallback to types/files.py if mimetypes doesn't return valid extensions
+        #################
+        # litellm runs on docker containers and `mimetypes` depends on the installed mimetypes of the OS
+        # we fallback to well known mime types in types/files.py if mimetypes doesn't return valid extensions
+        if not valid_extensions:
+            try:
+                fallback_extension = get_file_extension_from_mime_type(mime_type)
+                if fallback_extension in supported_doc_formats:
+                    valid_extensions = [fallback_extension]
+            except ValueError:
+                # Neither mimetypes nor files.py could handle this MIME type
+                # get_file_extension_from_mime_type raises ValueError if the mime type is not supported
+                pass
+
+        if not valid_extensions:
+            raise ValueError(
+                f"No supported extensions for MIME type: {mime_type}. Supported formats: {supported_doc_formats}"
+            )
+
+        # Use first valid extension instead of provided image_format
+        return valid_extensions[0]
 
     @staticmethod
     def _create_bedrock_block(
@@ -2505,12 +2707,39 @@ class BedrockImageProcessor:
             for video_type in supported_video_formats
         )
 
+        HASH_SAMPLE_BYTES = 64 * 1024  # hash up to 64 KB of data
+
         if is_document:
+            # --- Prepare normalized bytes for hashing (without modifying original) ---
+            if isinstance(image_bytes, str):
+                # Remove whitespace/newlines so base64 variations hash identically
+                normalized = "".join(image_bytes.split()).encode("utf-8")
+            else:
+                normalized = image_bytes
+
+            # --- Use only the first 64 KB for speed ---
+            if len(normalized) <= HASH_SAMPLE_BYTES:
+                sample = normalized
+            else:
+                sample = normalized[:HASH_SAMPLE_BYTES]
+
+            # --- Compute deterministic hash (sample + total length) ---
+            hasher = hashlib.sha256()
+            hasher.update(sample)
+            hasher.update(
+                str(len(normalized)).encode("utf-8")
+            )  # include full length for uniqueness
+            full_hash = hasher.hexdigest()
+            content_hash = full_hash[:16]  # short deterministic ID
+
+            document_name = f"DocumentPDFmessages_{content_hash}_{image_format}"
+
+            # --- Return content block ---
             return BedrockContentBlock(
                 document=BedrockDocumentBlock(
                     source=_blob,
                     format=image_format,
-                    name=f"DocumentPDFmessages_{str(uuid.uuid4())}",
+                    name=document_name,
                 )
             )
         elif is_video:
@@ -2617,12 +2846,22 @@ def _convert_to_bedrock_tool_call_invoke(
                 id = tool["id"]
                 name = tool["function"].get("name", "")
                 arguments = tool["function"].get("arguments", "")
-                arguments_dict = json.loads(arguments)
+                if not arguments or not arguments.strip():
+                    arguments_dict = {}
+                else:
+                    arguments_dict = json.loads(arguments)
                 bedrock_tool = BedrockToolUseBlock(
                     input=arguments_dict, name=name, toolUseId=id
                 )
                 bedrock_content_block = BedrockContentBlock(toolUse=bedrock_tool)
                 _parts_list.append(bedrock_content_block)
+
+                # Check for cache_control and add a separate cachePoint block
+                if tool.get("cache_control", None) is not None:
+                    cache_point_block = BedrockContentBlock(
+                        cachePoint=CachePointBlock(type="default")
+                    )
+                    _parts_list.append(cache_point_block)
         return _parts_list
     except Exception as e:
         raise Exception(
@@ -2683,6 +2922,7 @@ def _convert_to_bedrock_tool_call_result(
         for content in content_list:
             if content["type"] == "text":
                 content_str += content["text"]
+
     message.get("name", "")
     id = str(message.get("tool_call_id", str(uuid.uuid4())))
 
@@ -2691,6 +2931,7 @@ def _convert_to_bedrock_tool_call_result(
         content=[tool_result_content_block],
         toolUseId=id,
     )
+
     content_block = BedrockContentBlock(toolResult=tool_result)
 
     return content_block
@@ -2934,7 +3175,10 @@ def process_empty_text_blocks(
         ]
 
     modified_message = message.copy()
-    modified_message["content"] = modified_content_block
+    modified_message["content"] = cast(
+        Union[List[ChatCompletionTextObject], List[ChatCompletionThinkingBlock]],
+        modified_content_block,
+    )
     return modified_message
 
 
@@ -3052,6 +3296,12 @@ class BedrockConverseMessagesProcessor:
                             if element["type"] == "text":
                                 _part = BedrockContentBlock(text=element["text"])
                                 _parts.append(_part)
+                            elif element["type"] == "guarded_text":
+                                # Wrap guarded_text in guardContent block
+                                _part = BedrockContentBlock(
+                                    guardContent={"text": {"text": element["text"]}}
+                                )
+                                _parts.append(_part)
                             elif element["type"] == "image_url":
                                 format: Optional[str] = None
                                 if isinstance(element["image_url"], dict):
@@ -3120,9 +3370,33 @@ class BedrockConverseMessagesProcessor:
             ## MERGE CONSECUTIVE TOOL CALL MESSAGES ##
             tool_content: List[BedrockContentBlock] = []
             while msg_i < len(messages) and messages[msg_i]["role"] == "tool":
-                tool_call_result = _convert_to_bedrock_tool_call_result(messages[msg_i])
-
+                current_message = messages[msg_i]
+                tool_call_result = _convert_to_bedrock_tool_call_result(current_message)
                 tool_content.append(tool_call_result)
+
+                # Check if we need to add a separate cachePoint block
+                has_cache_control = False
+
+                # Check for message-level cache_control
+                if current_message.get("cache_control", None) is not None:
+                    has_cache_control = True
+                # Check for content-level cache_control in list content
+                elif isinstance(current_message.get("content"), list):
+                    for content_element in current_message["content"]:
+                        if (
+                            isinstance(content_element, dict)
+                            and content_element.get("cache_control", None) is not None
+                        ):
+                            has_cache_control = True
+                            break
+
+                # Add a separate cachePoint block if cache_control is present
+                if has_cache_control:
+                    cache_point_block = BedrockContentBlock(
+                        cachePoint=CachePointBlock(type="default")
+                    )
+                    tool_content.append(cache_point_block)
+
                 msg_i += 1
             if tool_content:
                 # if last message was a 'user' message, then add a blank assistant message (bedrock requires alternating roles)
@@ -3202,6 +3476,17 @@ class BedrockConverseMessagesProcessor:
                                     image_url=image_url
                                 )
                                 assistants_parts.append(assistants_part)
+                                # Add cache point block for assistant content elements
+                        _cache_point_block = (
+                            litellm.AmazonConverseConfig()._get_cache_point_block(
+                                message_block=cast(
+                                    OpenAIMessageContentListBlock, element
+                                ),
+                                block_type="content_block",
+                            )
+                        )
+                        if _cache_point_block is not None:
+                            assistants_parts.append(_cache_point_block)
                     assistant_content.extend(assistants_parts)
                 elif _assistant_content is not None and isinstance(
                     _assistant_content, str
@@ -3209,6 +3494,15 @@ class BedrockConverseMessagesProcessor:
                     assistant_content.append(
                         BedrockContentBlock(text=_assistant_content)
                     )
+                    # Add cache point block for assistant string content
+                    _cache_point_block = (
+                        litellm.AmazonConverseConfig()._get_cache_point_block(
+                            assistant_message_block, block_type="content_block"
+                        )
+                    )
+                    if _cache_point_block is not None:
+                        assistant_content.append(_cache_point_block)
+
                 _tool_calls = assistant_message_block.get("tool_calls", [])
                 if _tool_calls:
                     assistant_content.extend(
@@ -3383,6 +3677,12 @@ def _bedrock_converse_messages_pt(  # noqa: PLR0915
                         if element["type"] == "text":
                             _part = BedrockContentBlock(text=element["text"])
                             _parts.append(_part)
+                        elif element["type"] == "guarded_text":
+                            # Wrap guarded_text in guardContent block
+                            _part = BedrockContentBlock(
+                                guardContent={"text": {"text": element["text"]}}
+                            )
+                            _parts.append(_part)
                         elif element["type"] == "image_url":
                             format: Optional[str] = None
                             if isinstance(element["image_url"], dict):
@@ -3451,8 +3751,34 @@ def _bedrock_converse_messages_pt(  # noqa: PLR0915
         tool_content: List[BedrockContentBlock] = []
         while msg_i < len(messages) and messages[msg_i]["role"] == "tool":
             tool_call_result = _convert_to_bedrock_tool_call_result(messages[msg_i])
+            current_message = messages[msg_i]
 
+            # Add the tool result first
             tool_content.append(tool_call_result)
+
+            # Check if we need to add a separate cachePoint block
+            has_cache_control = False
+
+            # Check for message-level cache_control
+            if current_message.get("cache_control", None) is not None:
+                has_cache_control = True
+            # Check for content-level cache_control in list content
+            elif isinstance(current_message.get("content"), list):
+                for content_element in current_message["content"]:
+                    if (
+                        isinstance(content_element, dict)
+                        and content_element.get("cache_control", None) is not None
+                    ):
+                        has_cache_control = True
+                        break
+
+            # Add a separate cachePoint block if cache_control is present
+            if has_cache_control:
+                cache_point_block = BedrockContentBlock(
+                    cachePoint=CachePointBlock(type="default")
+                )
+                tool_content.append(cache_point_block)
+
             msg_i += 1
         if tool_content:
             # if last message was a 'user' message, then add a blank assistant message (bedrock requires alternating roles)
@@ -3513,7 +3839,9 @@ def _bedrock_converse_messages_pt(  # noqa: PLR0915
                                 assistant_parts=assistants_parts,
                             )
                         elif element["type"] == "text":
-                            assistants_part = BedrockContentBlock(text=element["text"])
+                            # AWS Bedrock doesn't allow empty or whitespace-only text content, so use placeholder for empty strings
+                            text_content = element["text"] if element["text"].strip() else "."
+                            assistants_part = BedrockContentBlock(text=text_content)
                             assistants_parts.append(assistants_part)
                         elif element["type"] == "image_url":
                             if isinstance(element["image_url"], dict):
@@ -3524,9 +3852,30 @@ def _bedrock_converse_messages_pt(  # noqa: PLR0915
                                 image_url=image_url
                             )
                             assistants_parts.append(assistants_part)
+                        # Add cache point block for assistant content elements
+                        _cache_point_block = (
+                            litellm.AmazonConverseConfig()._get_cache_point_block(
+                                message_block=cast(
+                                    OpenAIMessageContentListBlock, element
+                                ),
+                                block_type="content_block",
+                            )
+                        )
+                        if _cache_point_block is not None:
+                            assistants_parts.append(_cache_point_block)
                 assistant_content.extend(assistants_parts)
             elif _assistant_content is not None and isinstance(_assistant_content, str):
-                assistant_content.append(BedrockContentBlock(text=_assistant_content))
+                # AWS Bedrock doesn't allow empty or whitespace-only text content, so use placeholder for empty strings
+                text_content = _assistant_content if _assistant_content.strip() else "."
+                assistant_content.append(BedrockContentBlock(text=text_content))
+                # Add cache point block for assistant string content
+                _cache_point_block = (
+                    litellm.AmazonConverseConfig()._get_cache_point_block(
+                        assistant_message_block, block_type="content_block"
+                    )
+                )
+                if _cache_point_block is not None:
+                    assistant_content.append(_cache_point_block)
             _tool_calls = assistant_message_block.get("tool_calls", [])
             if _tool_calls:
                 assistant_content.extend(
@@ -3655,9 +4004,11 @@ def _bedrock_tools_pt(tools: List) -> List[BedrockToolBlock]:
         # related issue: https://github.com/BerriAI/litellm/issues/5007
         # Bedrock tool names must satisfy regular expression pattern: [a-zA-Z][a-zA-Z0-9_]* ensure this is true
         name = make_valid_bedrock_tool_name(input_tool_name=name)
-        description = tool.get("function", {}).get(
-            "description", name
-        )  # converse api requires a description
+        _tool_description = tool.get("function", {}).get("description", None)
+        if _tool_description:  # bedrock doesn't accept empty "" or None descriptions
+            description = _tool_description
+        else:
+            description = name
 
         defs = parameters.pop("$defs", {})
         defs_copy = copy.deepcopy(defs)
@@ -3695,7 +4046,12 @@ def function_call_prompt(messages: list, functions: list):
     function_added_to_prompt = False
     for message in messages:
         if "system" in message["role"]:
-            message["content"] += f""" {function_prompt}"""
+            if isinstance(message["content"], str):
+                message["content"] += f""" {function_prompt}"""
+            else:
+                message["content"].append(
+                    {"type": "text", "text": f""" {function_prompt}"""}
+                )
             function_added_to_prompt = True
 
     if function_added_to_prompt is False:
@@ -3856,33 +4212,12 @@ def prompt_factory(
     elif custom_llm_provider == "azure_text":
         return azure_text_pt(messages=messages)
     elif custom_llm_provider == "watsonx":
-        if "granite" in model and "chat" in model:
-            # granite-13b-chat-v1 and granite-13b-chat-v2 use a specific prompt template
-            return ibm_granite_pt(messages=messages)
-        elif "ibm-mistral" in model and "instruct" in model:
-            # models like ibm-mistral/mixtral-8x7b-instruct-v01-q use the mistral instruct prompt template
-            return mistral_instruct_pt(messages=messages)
-        elif "meta-llama/llama-3" in model and "instruct" in model:
-            # https://llama.meta.com/docs/model-cards-and-prompt-formats/meta-llama-3/
-            return custom_prompt(
-                role_dict={
-                    "system": {
-                        "pre_message": "<|start_header_id|>system<|end_header_id|>\n",
-                        "post_message": "<|eot_id|>",
-                    },
-                    "user": {
-                        "pre_message": "<|start_header_id|>user<|end_header_id|>\n",
-                        "post_message": "<|eot_id|>",
-                    },
-                    "assistant": {
-                        "pre_message": "<|start_header_id|>assistant<|end_header_id|>\n",
-                        "post_message": "<|eot_id|>",
-                    },
-                },
-                messages=messages,
-                initial_prompt_value="<|begin_of_text|>",
-                final_prompt_value="<|start_header_id|>assistant<|end_header_id|>\n",
-            )
+        from litellm.llms.watsonx.chat.transformation import IBMWatsonXChatConfig
+
+        return IBMWatsonXChatConfig.apply_prompt_template(
+            model=model, messages=messages
+        )
+
     try:
         if "meta-llama/llama-2" in model and "chat" in model:
             return llama_2_chat_pt(messages=messages)

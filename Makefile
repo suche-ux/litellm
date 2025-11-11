@@ -34,21 +34,21 @@ install-proxy-dev:
 
 # CI-compatible installations (matches GitHub workflows exactly)
 install-dev-ci:
-	pip install openai==1.81.0
+	pip install openai==1.99.5
 	poetry install --with dev
-	pip install openai==1.81.0
+	pip install openai==1.99.5
 
 install-proxy-dev-ci:
 	poetry install --with dev,proxy-dev --extras proxy
-	pip install openai==1.81.0
+	pip install openai==1.99.5
 
 install-test-deps: install-proxy-dev
 	poetry run pip install "pytest-retry==1.6.3"
 	poetry run pip install pytest-xdist
-	cd enterprise && python -m pip install -e . && cd ..
+	cd enterprise && poetry run pip install -e . && cd ..
 
 install-helm-unittest:
-	helm plugin install https://github.com/helm-unittest/helm-unittest --version v0.4.4
+	helm plugin install https://github.com/helm-unittest/helm-unittest --version v0.4.4 || echo "ignore error if plugin exists"
 
 # Formatting
 format: install-dev
@@ -88,3 +88,16 @@ test-integration:
 
 test-unit-helm: install-helm-unittest
 	helm unittest -f 'tests/*.yaml' deploy/charts/litellm-helm
+
+# LLM Translation testing targets
+test-llm-translation: install-test-deps
+	@echo "Running LLM translation tests..."
+	@python .github/workflows/run_llm_translation_tests.py
+
+test-llm-translation-single: install-test-deps
+	@echo "Running single LLM translation test file..."
+	@if [ -z "$(FILE)" ]; then echo "Usage: make test-llm-translation-single FILE=test_filename.py"; exit 1; fi
+	@mkdir -p test-results
+	poetry run pytest tests/llm_translation/$(FILE) \
+		--junitxml=test-results/junit.xml \
+		-v --tb=short --maxfail=100 --timeout=300

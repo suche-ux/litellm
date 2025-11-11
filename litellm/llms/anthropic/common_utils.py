@@ -2,7 +2,7 @@
 This file contains common utils for anthropic calls.
 """
 
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 
@@ -10,10 +10,11 @@ import litellm
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     get_file_ids_from_messages,
 )
-from litellm.llms.base_llm.base_utils import BaseLLMModelInfo
+from litellm.llms.base_llm.base_utils import BaseLLMModelInfo, BaseTokenCounter
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.anthropic import AllAnthropicToolsValues, AnthropicMcpServerTool
 from litellm.types.llms.openai import AllMessageValues
+from litellm.types.utils import TokenCountResponse
 
 
 class AnthropicError(BaseLLMException):
@@ -62,13 +63,14 @@ class AnthropicModelInfo(BaseLLMModelInfo):
 
     def is_computer_tool_used(
         self, tools: Optional[List[AllAnthropicToolsValues]]
-    ) -> bool:
+    ) -> Optional[str]:
+        """Returns the computer tool version if used, e.g. 'computer_20250124' or None"""
         if tools is None:
-            return False
+            return None
         for tool in tools:
             if "type" in tool and tool["type"].startswith("computer_"):
-                return True
-        return False
+                return tool["type"]
+        return None
 
     def is_pdf_used(self, messages: List[AllMessageValues]) -> bool:
         """
@@ -93,11 +95,29 @@ class AnthropicModelInfo(BaseLLMModelInfo):
             return None
         return anthropic_beta_header.split(",")
 
+    def get_computer_tool_beta_header(self, computer_tool_version: str) -> str:
+        """
+        Get the appropriate beta header for a given computer tool version.
+        
+        Args:
+            computer_tool_version: The computer tool version (e.g., 'computer_20250124', 'computer_20241022')
+            
+        Returns:
+            The corresponding beta header string
+        """
+        computer_tool_beta_mapping = {
+            "computer_20250124": "computer-use-2025-01-24",
+            "computer_20241022": "computer-use-2024-10-22",
+        }
+        return computer_tool_beta_mapping.get(
+            computer_tool_version, "computer-use-2024-10-22"  # Default fallback
+        )
+
     def get_anthropic_headers(
         self,
         api_key: str,
         anthropic_version: Optional[str] = None,
-        computer_tool_used: bool = False,
+        computer_tool_used: Optional[str] = None,
         prompt_caching_set: bool = False,
         pdf_used: bool = False,
         file_id_used: bool = False,
@@ -109,7 +129,8 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         if prompt_caching_set:
             betas.add("prompt-caching-2024-07-31")
         if computer_tool_used:
-            betas.add("computer-use-2024-10-22")
+            beta_header = self.get_computer_tool_beta_header(computer_tool_used)
+            betas.add(beta_header)
         # if pdf_used:
         #     betas.add("pdfs-2024-09-25")
         if file_id_used:
@@ -228,6 +249,53 @@ class AnthropicModelInfo(BaseLLMModelInfo):
             litellm_model_name = "anthropic/" + stripped_model_name
             litellm_model_names.append(litellm_model_name)
         return litellm_model_names
+
+    def get_token_counter(self) -> Optional[BaseTokenCounter]:
+        """
+        Factory method to create an Anthropic token counter.
+        
+        Returns:
+            AnthropicTokenCounter instance for this provider.
+        """
+        return AnthropicTokenCounter()
+
+
+class AnthropicTokenCounter(BaseTokenCounter):
+    """Token counter implementation for Anthropic provider."""
+
+    def should_use_token_counting_api(
+        self, 
+        custom_llm_provider: Optional[str] = None,
+    ) -> bool:
+        from litellm.types.utils import LlmProviders
+        return custom_llm_provider == LlmProviders.ANTHROPIC.value
+    
+    async def count_tokens(
+        self,
+        model_to_use: str,
+        messages: Optional[List[Dict[str, Any]]],
+        contents: Optional[List[Dict[str, Any]]],
+        deployment: Optional[Dict[str, Any]] = None,
+        request_model: str = "",
+    ) -> Optional[TokenCountResponse]:
+        from litellm.proxy.utils import count_tokens_with_anthropic_api
+        
+        result = await count_tokens_with_anthropic_api(
+            model_to_use=model_to_use,
+            messages=messages,
+            deployment=deployment,
+        )
+        
+        if result is not None:
+            return TokenCountResponse(
+                total_tokens=result.get("total_tokens", 0),
+                request_model=request_model,
+                model_used=model_to_use,
+                tokenizer_type=result.get("tokenizer_used", ""),
+                original_response=result,
+            )
+        
+        return None
 
 
 def process_anthropic_headers(headers: Union[httpx.Headers, dict]) -> dict:
